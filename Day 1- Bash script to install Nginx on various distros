@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# A script to install Nginx based on the Linux distribution
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root or with sudo"
+  exit 1
+fi
+
+# First, detect the OS running on the device
+if [[ -f /etc/os-release ]]; then
+  source /etc/os-release
+  OS=$ID
+else
+  echo "Cannot detect OS: /etc/os-release not found"
+  exit 1
+fi
+
+echo "Detected OS: $OS"
+echo "Installing Nginx..."
+
+case "$OS" in
+  ubuntu | debian | linuxmint | pop | raspbian)
+    apt update -y && apt install -y nginx
+    ;;
+  fedora)
+    dnf install -y nginx
+    ;;
+  centos | rhel | almalinux | rocky | ol)
+    yum install -y epel-release
+    yum install -y nginx
+    ;;
+  amzn)
+    amazon-linux-extras enable nginx1
+    yum install -y nginx
+    ;;
+  arch | manjaro | endeavouros)
+    pacman -Sy --noconfirm nginx
+    ;;
+  opensuse* | sles)
+    zypper install -y nginx
+    ;;
+  alpine)
+    apk add nginx
+    ;;
+  *)
+    echo "Unsupported distro: $OS"
+    echo "Please install Nginx manually."
+    exit 1
+    ;;
+esac
+
+# Enable and start the service
+if command -v systemctl &>/dev/null; then
+  systemctl enable nginx
+  systemctl start nginx
+elif command -v rc-service &>/dev/null; then
+  rc-update add nginx default
+  rc-service nginx start
+fi
+
+# Verify installation
+if command -v nginx &>/dev/null; then
+  echo ""
+  echo "Nginx installed successfully: $(nginx -v 2>&1)"
+else
+  echo "Nginx installation failed."
+  exit 1
+fi
