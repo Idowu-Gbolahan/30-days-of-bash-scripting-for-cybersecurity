@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# disk_security_monitor.sh
+# Monitors disk utilization through a cybersecurity lens.
+# Detects: DoS via disk exhaustion, log tampering, malware payloads,
+#          SUID/SGID binaries, hidden files, inode exhaustion,
+#          world-writable directories, and rapid disk growth.
+#   sudo bash disk_security_monitor.sh
+# Runs every hour. Logs to /var/log/disk_security_monitor.log
+# Alerts are written to /var/log/disk_security_alerts.log
+
+set -Eeuo pipefail
+
+# Configuration
+DISK_THRESHOLD=80           # Alert when disk usage exceeds this %
+INODE_THRESHOLD=80          # Alert when inode usage exceeds this %
+LARGE_FILE_SIZE="+500M"     # Flag files larger than 500MB
+GROWTH_THRESHOLD=10         # Alert if disk grows more than 10% in one hour
+WATCH_DIRS=(
+  "/tmp"
+  "/var/tmp"
+  "/dev/shm"
+  "/var/log"
+  "/home"
+  "/root"
+  "/etc"
+  "/usr/bin"
+  "/usr/sbin"
+)
+LOG_FILE="/var/log/disk_security_monitor.log"
+ALERT_FILE="/var/log/disk_security_alerts.log"
+STATE_FILE="/var/lib/disk_security_monitor.state"
+
+# Logging helpers
+log()
+{ 
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO]  $*" | tee -a "$LOG_FILE"; 
+}
+
+alert()
+{ 
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ALERT] $*" | tee -a "$LOG_FILE" | tee -a "$ALERT_FILE"; 
+}
+sep()
+{ 
+    log "────────────────────────────────────────────────"; 
+}
+
+# Root check 
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root or with sudo."
+  exit 1
+fi
+
+# Ensure state directory exists
+mkdir -p "$(dirname "$STATE_FILE")"
+
+# CHECK 1: Disk Space Exhaustion (DoS Vector)
+check_disk_exhaustion() {
+  sep
+  log "CHECK 1: Disk space exhaustion"
+
+  while read -r usage mount; do
+    usage="${usage%\%}"
+
+    if [[ "$usage" -gt "$DISK_THRESHOLD" ]]; then
+      alert "Disk exhaustion risk: $mount is at ${usage}% — exceeds threshold of ${DISK_THRESHOLD}%."
+      alert "  Impact: services may crash; logging may stop — system goes blind to attacks."
+      alert "  Action: Investigate large/unexpected files. Run: du -sh $mount/* | sort -rh | head -20"
+    else
+      log "  $mount — ${usage}% used. OK."
+    fi
+  done < <(df --output=pcent,target | tail -n +2)
+}
+
+# CHECK 2: Inode Exhaustion
+
+check_inode_exhaustion() {
+  sep
+  log "CHECK 2: Inode exhaustion"
+
+  while read -r iuse mount; do
+    iuse="${iuse%\%}"
+
+    # Skip pseudo-filesystems that report - for inode usage
+    [[ "$iuse" == "-" ]] && continue
+
+    if [[ "$iuse" -gt "$INODE_THRESHOLD" ]]; then
+      alert "Inode exhaustion risk: $mount is at ${iuse}% inode usage."
+      alert "  Impact: system cannot create new files even if disk space is available."
+      alert "  Action: Find directories with many small files: find $mount -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head -10"
+    else
+      log "  $mount — ${iuse}% inodes used. OK."
+    fi
+  done < <(df --output=ipcent,target | tail -n +2)
+}
+
+# CHECK 3: Rapid Disk Growth (Ransomware / Crypto Miner / Data Staging IOC)
+
+check_rapid_growth() {
+  sep
+  log "CHECK 3: Rapid disk growth (ransomware / miner / staging IOC)"
+
+  while read -r usage mount; do
+    usage="${usage%\%}"
+    key="${mount//\//_}"  # Convert /var/log to _var_log for use as a key
+
+    # Read previous usage from state file
+    prev_usage=""
+    if [[ -f "$STATE_FILE" ]]; then
+      prev_usage=$(grep "^${key}=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+    fi
+
+    if [[ -n "$prev_usage" ]]; then
+      growth=$(( usage - prev_usage ))
+      if [[ "$growth" -gt "$GROWTH_THRESHOLD" ]]; then
+        alert "Rapid disk growth detected on $mount: grew ${growth}% in the last hour (${prev_usage}% → ${usage}%)."
+        alert "  Possible causes: ransomware encryption, crypto miner DAG files, exfiltration staging."
+        alert "  Action: Immediately run: find $mount -xdev -newer $STATE_FILE -ls | sort -k7 -rn | head -20"
+      else
+        log "  $mount — grew ${growth}% since last check (${prev_usage}% → ${usage}%). OK."
+      fi
+    else
+      log "  $mount — no previous state recorded. Baseline set at ${usage}%."
+    fi
+
+    # Update state file with current usage
+    if [[ -f "$STATE_FILE" ]]; then
+      # Remove old entry for this mount and append new one
+      sed -i "/^${key}=/d" "$STATE_FILE"
+    fi
+    echo "${key}=${usage}" >> "$STATE_FILE"
+
+  done < <(df --output=pcent,target | tail -n +2)
+}
+
+# CHECK 4: Large Unexpected Files (Malware Payloads / Exfiltration Staging)
+
+check_large_files() {
+  sep
+  log "CHECK 4: Large unexpected files in sensitive directories (>${LARGE_FILE_SIZE})"
+
+  for dir in "${WATCH_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+
+    while IFS= read -r file; do
+      size=$(du -sh "$file" 2>/dev/null | cut -f1)
+      alert "Large file found: $file ($size)"
+      alert "  Possible cause: malware payload, exfiltration archive, or miner cache."
+      alert "  Action: Inspect with: file '$file' && sha256sum '$file'"
+    done < <(find "$dir" -xdev -type f -size "$LARGE_FILE_SIZE" 2>/dev/null)
+
+  done
+
+  log "  Large file scan complete."
+}
+
+# CHECK 5: SUID / SGID Binaries Outside Standard Paths (Privilege Escalation)
+
+check_suid_sgid() {
+  sep
+  log "CHECK 5: SUID/SGID binaries outside standard system paths (privilege escalation)"
+
+  # Known safe base paths — extend this list to match your system
+  SAFE_PATHS=(/bin /sbin /usr/bin /usr/sbin /usr/lib /usr/lib64 /usr/libexec)
+
+  while IFS= read -r file; do
+    safe=false
+    for safe_path in "${SAFE_PATHS[@]}"; do
+      if [[ "$file" == "$safe_path"* ]]; then
+        safe=true
+        break
+      fi
+    done
+
+    if [[ "$safe" == false ]]; then
+      perms=$(stat -c "%A %U %G" "$file" 2>/dev/null)
+      alert "Suspicious SUID/SGID binary: $file ($perms)"
+      alert "  Risk: can be used for privilege escalation to root."
+      alert "  Action: Verify with: stat '$file' && rpm -qf '$file' || dpkg -S '$file'"
+    fi
+  done < <(find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
+
+  log "  SUID/SGID scan complete."
+}
+
+# CHECK 6: Hidden Files in Sensitive Directories (Persistence / Backdoors)
+
+check_hidden_files() {
+  sep
+  log "CHECK 6: Hidden files in sensitive directories (persistence / backdoors)"
+
+  HIDDEN_WATCH_DIRS=("/tmp" "/var/tmp" "/dev/shm" "/etc")
+
+  for dir in "${HIDDEN_WATCH_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+
+    while IFS= read -r file; do
+      perms=$(stat -c "%A %U %G" "$file" 2>/dev/null)
+      alert "Hidden file found: $file ($perms)"
+      alert "  Risk: possible backdoor, malware config, or planted SSH key."
+      alert "  Action: Inspect with: cat '$file' && file '$file'"
+    done < <(find "$dir" -xdev -name ".*" -type f 2>/dev/null)
+
+  done
+
+  log "  Hidden file scan complete."
+}
+
+# CHECK 7: World-Writable Directories (Malware Drop Zones)
+
+check_world_writable_dirs() {
+  sep
+  log "CHECK 7: Unexpected world-writable directories (malware drop zones)"
+
+  # These are legitimately world-writable — skip them
+  ALLOWED_WRITABLE=("/tmp" "/var/tmp" "/dev/shm")
+
+  while IFS= read -r dir; do
+    allowed=false
+    for allowed_dir in "${ALLOWED_WRITABLE[@]}"; do
+      if [[ "$dir" == "$allowed_dir" ]]; then
+        allowed=true
+        break
+      fi
+    done
+
+    if [[ "$allowed" == false ]]; then
+      perms=$(stat -c "%A %U %G" "$dir" 2>/dev/null)
+      alert "World-writable directory found: $dir ($perms)"
+      alert "  Risk: any user or process can drop files here — common malware staging area."
+      alert "  Action: Remove world-write if unneeded: chmod o-w '$dir'"
+    fi
+  done < <(find / -xdev -type d -perm -0002 2>/dev/null)
+
+  log "  World-writable directory scan complete."
+}
+
+# CHECK 8: Log Directory Integrity (Tamper Detection)
+check_log_integrity() {
+  sep
+  log "CHECK 8: Log file integrity (tamper / deletion / silencing detection)"
+
+  CRITICAL_LOGS=(
+    "/var/log/auth.log"       # SSH logins, sudo usage (Debian/Ubuntu)
+    "/var/log/secure"         # SSH logins, sudo usage (RHEL/CentOS)
+    "/var/log/syslog"         # General system events (Debian/Ubuntu)
+    "/var/log/messages"       # General system events (RHEL/CentOS)
+    "/var/log/audit/audit.log" # auditd — kernel-level audit trail
+  )
+
+  for logfile in "${CRITICAL_LOGS[@]}"; do
+    [[ -f "$logfile" ]] || { log "  $logfile — not present on this system. Skipping."; continue; }
+
+    # Check file is non-empty
+    if [[ ! -s "$logfile" ]]; then
+      alert "Log file is empty: $logfile"
+      alert "  Risk: log may have been truncated to erase evidence."
+      alert "  Action: Check last modification: stat '$logfile' && journalctl -n 100"
+      continue
+    fi
+
+    # Check file has been written to in the last 2 hours
+    if ! find "$logfile" -mmin -120 | grep -q .; then
+      alert "Log file has not been written to in over 2 hours: $logfile"
+      alert "  Risk: logging may be stopped due to disk exhaustion or active tampering."
+      alert "  Action: Check logging daemon: systemctl status rsyslog syslog auditd"
+    else
+      log "  $logfile — exists, non-empty, recently written. OK."
+    fi
+
+  done
+}
+
+# Main: run all checks, then sleep 1 hour and repeat
+log "================================================================"
+log "Disk Security Monitor started."
+log "Disk threshold : ${DISK_THRESHOLD}%"
+log "Inode threshold: ${INODE_THRESHOLD}%"
+log "Growth threshold: ${GROWTH_THRESHOLD}% per hour"
+log "Alerts log     : $ALERT_FILE"
+log "================================================================"
+
+while true; do
+  log "Starting security checks — $(date '+%Y-%m-%d %H:%M:%S')"
+
+  check_disk_exhaustion
+  check_inode_exhaustion
+  check_rapid_growth
+  check_large_files
+  check_suid_sgid
+  check_hidden_files
+  check_world_writable_dirs
+  check_log_integrity
+
+  sep
+  log "All checks complete. Next run in 1 hour."
+  log "================================================================"
+
+  sleep 3600
+done
